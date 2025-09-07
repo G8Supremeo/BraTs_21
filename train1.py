@@ -239,12 +239,12 @@ class TrainingProgressTracker:
 class CheckpointManager:
     """Manage checkpoints for large models with size limits"""
     
-    def __init__(self, checkpoint_dir, max_checkpoints=5, size_limit_gb=2.0, retain_best=5, retain_latest=3):
+    def __init__(self, checkpoint_dir, max_checkpoints=5, size_limit_gb=2.0, retain_best=3, retain_latest=2):
         self.checkpoint_dir = checkpoint_dir
         self.max_checkpoints = max_checkpoints
         self.size_limit_gb = size_limit_gb * (1024**3)  # Convert to bytes
         # Retention policies
-        self.retain_best = max(5, retain_best)  # Always keep at least last 5 best (per user request)
+        self.retain_best = retain_best
         self.retain_latest = retain_latest
         
     def _print_size_notice(self, file_path, label):
