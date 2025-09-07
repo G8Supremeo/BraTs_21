@@ -244,6 +244,12 @@ class CheckpointManager:
         self.max_checkpoints = max_checkpoints
         self.size_limit_gb = size_limit_gb * (1024**3)  # Convert to bytes
         
+    def _print_size_notice(self, file_path, label):
+        size_mb = self.get_checkpoint_size_mb(file_path)
+        print(f"💾 Saved checkpoint: {label} ({size_mb:.1f} MB)")
+        if size_mb > (self.size_limit_gb / (1024**2)):
+            print(f"⚠️  Checkpoint size ({size_mb:.1f} MB) exceeds limit")
+
     def cleanup_old_checkpoints(self):
         """Remove old checkpoints to save space"""
         checkpoint_files = glob.glob(os.path.join(self.checkpoint_dir, "*.pth"))
@@ -285,13 +291,33 @@ class CheckpointManager:
         torch.save(checkpoint_data, file_path)
         
         # Check size and cleanup if needed
-        size_mb = self.get_checkpoint_size_mb(file_path)
-        print(f"💾 Saved checkpoint: {filename} ({size_mb:.1f} MB)")
-        
-        if size_mb > (self.size_limit_gb / (1024**2)):
-            print(f"⚠️  Checkpoint size ({size_mb:.1f} MB) exceeds limit")
+        self._print_size_notice(file_path, filename)
         
         # Cleanup old checkpoints
+        self.cleanup_old_checkpoints()
+
+    def save_weights_only(self, model, epoch, metrics, filename, dtype=torch.float16):
+        """Save weights-only checkpoint, optionally in reduced precision to cut size."""
+        file_path = os.path.join(self.checkpoint_dir, filename)
+        state_dict = model.state_dict()
+        if dtype is not None:
+            reduced_state = {k: v.detach().to('cpu', dtype=dtype) for k, v in state_dict.items()}
+            saved_dtype = str(dtype)
+        else:
+            reduced_state = {k: v.detach().cpu() for k, v in state_dict.items()}
+            saved_dtype = 'float32'
+
+        checkpoint_data = {
+            'epoch': epoch,
+            'model_state_dict': reduced_state,
+            'optimizer_state_dict': None,  # not included
+            'metrics': metrics,
+            'weights_dtype': saved_dtype,
+            'timestamp': datetime.now().isoformat()
+        }
+
+        torch.save(checkpoint_data, file_path)
+        self._print_size_notice(file_path, filename)
         self.cleanup_old_checkpoints()
 
 
@@ -529,13 +555,42 @@ def train_model(train_loader, val_loader):
 
     # Resume training
     start_epoch = 0
+    resume_loaded = False
     if os.path.exists(checkpoint_path):
-        print(f"⏪ Resuming from checkpoint: {checkpoint_path}")
-        checkpoint = torch.load(checkpoint_path, map_location=device)
-        model.load_state_dict(checkpoint['model_state_dict'])
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        start_epoch = checkpoint['epoch'] + 1
-        print(f"✅ Resumed from epoch {start_epoch}")
+        try:
+            print(f"⏪ Resuming from checkpoint: {checkpoint_path}")
+            checkpoint = torch.load(checkpoint_path, map_location=device)
+            if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint and 'optimizer_state_dict' in checkpoint:
+                model.load_state_dict(checkpoint['model_state_dict'])
+                if checkpoint['optimizer_state_dict'] is not None:
+                    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                start_epoch = checkpoint['epoch'] + 1
+                print(f"✅ Resumed from epoch {start_epoch}")
+                resume_loaded = True
+        except Exception as e:
+            print(f"⚠️  Failed to load {checkpoint_path}: {e}")
+
+    # Fallback: pick most recent epoch checkpoint (with optimizer state)
+    if not resume_loaded:
+        epoch_ckpts = sorted(
+            glob.glob(os.path.join(checkpoint_dir, "latest_checkpoint_epoch_*.pth")),
+            key=lambda p: os.path.getmtime(p),
+            reverse=True,
+        )
+        for ckpt_file in epoch_ckpts:
+            try:
+                print(f"⏪ Attempting resume from: {ckpt_file}")
+                checkpoint = torch.load(ckpt_file, map_location=device)
+                if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint and 'optimizer_state_dict' in checkpoint:
+                    model.load_state_dict(checkpoint['model_state_dict'])
+                    if checkpoint['optimizer_state_dict'] is not None:
+                        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                    start_epoch = checkpoint.get('epoch', -1) + 1
+                    print(f"✅ Resumed from epoch {start_epoch}")
+                    resume_loaded = True
+                    break
+            except Exception as e:
+                print(f"⚠️  Failed to load {ckpt_file}: {e}")
 
 
     # Training loop
@@ -727,6 +782,16 @@ def train_model(train_loader, val_loader):
             checkpoint_manager.save_checkpoint(
                 model, optimizer, epoch, epoch_record,
                 f"best_model_epoch_{epoch+1}.pth"
+            )
+            # Also save a compact weights-only checkpoint for inference
+            checkpoint_manager.save_weights_only(
+                model, epoch, epoch_record,
+                f"best_model_epoch_{epoch+1}_weights_fp16.pth", dtype=torch.float16
+            )
+            # And update a stable small file path for downstream scripts
+            checkpoint_manager.save_weights_only(
+                model, epoch, epoch_record,
+                os.path.basename(best_checkpoint_path), dtype=torch.float16
             )
             print("📌 Best model saved!")
             epochs_no_improve = 0
