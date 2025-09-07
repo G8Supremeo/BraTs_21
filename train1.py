@@ -239,25 +239,50 @@ class TrainingProgressTracker:
 class CheckpointManager:
     """Manage checkpoints for large models with size limits"""
     
-    def __init__(self, checkpoint_dir, max_checkpoints=5, size_limit_gb=2.0):
+    def __init__(self, checkpoint_dir, max_checkpoints=5, size_limit_gb=2.0, retain_best=3, retain_latest=2):
         self.checkpoint_dir = checkpoint_dir
         self.max_checkpoints = max_checkpoints
         self.size_limit_gb = size_limit_gb * (1024**3)  # Convert to bytes
+        # Retention policies
+        self.retain_best = retain_best
+        self.retain_latest = retain_latest
+        
+    def _print_size_notice(self, file_path, label):
+        size_mb = self.get_checkpoint_size_mb(file_path)
+        print(f"💾 Saved checkpoint: {label} ({size_mb:.1f} MB)")
+        if size_mb > (self.size_limit_gb / (1024**2)):
+            print(f"⚠️  Checkpoint size ({size_mb:.1f} MB) exceeds limit")
         
     def cleanup_old_checkpoints(self):
-        """Remove old checkpoints to save space"""
-        checkpoint_files = glob.glob(os.path.join(self.checkpoint_dir, "*.pth"))
-        
-        # Sort by modification time (oldest first)
-        checkpoint_files.sort(key=lambda x: os.path.getmtime(x))
-        
-        # Keep only the newest max_checkpoints
-        if len(checkpoint_files) > self.max_checkpoints:
-            files_to_remove = checkpoint_files[:-self.max_checkpoints]
-            for file_path in files_to_remove:
+        """Remove old checkpoints to save space.
+        Policy:
+          - Keep at least the last N best full checkpoints (best_model_epoch_*.pth)
+          - Keep only a few latest full checkpoints (latest_checkpoint_epoch_*.pth)
+          - Do not delete stable files like best_model.pth or latest_checkpoint.pth
+        """
+        # Group files
+        best_files = glob.glob(os.path.join(self.checkpoint_dir, "best_model_epoch_*.pth"))
+        latest_files = glob.glob(os.path.join(self.checkpoint_dir, "latest_checkpoint_epoch_*.pth"))
+
+        # Sort by mtime (newest first)
+        best_files.sort(key=lambda x: os.path.getmtime(x), reverse=True)
+        latest_files.sort(key=lambda x: os.path.getmtime(x), reverse=True)
+
+        # Prune best files beyond retain_best
+        if len(best_files) > self.retain_best:
+            for file_path in best_files[self.retain_best:]:
                 try:
                     os.remove(file_path)
-                    print(f"🗑️  Removed old checkpoint: {os.path.basename(file_path)}")
+                    print(f"🗑️  Removed old best checkpoint: {os.path.basename(file_path)}")
+                except Exception as e:
+                    print(f"⚠️  Failed to remove {file_path}: {e}")
+
+        # Prune latest files beyond retain_latest
+        if self.retain_latest is not None and len(latest_files) > self.retain_latest:
+            for file_path in latest_files[self.retain_latest:]:
+                try:
+                    os.remove(file_path)
+                    print(f"🗑️  Removed old latest checkpoint: {os.path.basename(file_path)}")
                 except Exception as e:
                     print(f"⚠️  Failed to remove {file_path}: {e}")
     
@@ -285,14 +310,12 @@ class CheckpointManager:
         torch.save(checkpoint_data, file_path)
         
         # Check size and cleanup if needed
-        size_mb = self.get_checkpoint_size_mb(file_path)
-        print(f"💾 Saved checkpoint: {filename} ({size_mb:.1f} MB)")
-        
-        if size_mb > (self.size_limit_gb / (1024**2)):
-            print(f"⚠️  Checkpoint size ({size_mb:.1f} MB) exceeds limit")
+        self._print_size_notice(file_path, filename)
         
         # Cleanup old checkpoints
         self.cleanup_old_checkpoints()
+
+        # (weights-only save removed per user request; always save full FP32 checkpoints)
 
 
 class LiveTrainingVisualizer:
@@ -527,15 +550,65 @@ def train_model(train_loader, val_loader):
     # Mixed precision support
     scaler = torch.amp.GradScaler(enabled=use_amp)
 
-    # Resume training
+    # Resume training (prefer stable latest, then best, then recent latest epoch)
     start_epoch = 0
+    resume_loaded = False
     if os.path.exists(checkpoint_path):
-        print(f"⏪ Resuming from checkpoint: {checkpoint_path}")
-        checkpoint = torch.load(checkpoint_path, map_location=device)
-        model.load_state_dict(checkpoint['model_state_dict'])
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        start_epoch = checkpoint['epoch'] + 1
-        print(f"✅ Resumed from epoch {start_epoch}")
+        try:
+            print(f"⏪ Resuming from checkpoint: {checkpoint_path}")
+            checkpoint = torch.load(checkpoint_path, map_location=device)
+            if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+                model.load_state_dict(checkpoint['model_state_dict'])
+                if checkpoint.get('optimizer_state_dict'):
+                    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                start_epoch = checkpoint.get('epoch', -1) + 1
+                print(f"✅ Resumed from epoch {start_epoch}")
+                resume_loaded = True
+        except Exception as e:
+            print(f"⚠️  Failed to load {checkpoint_path}: {e}")
+
+    if not resume_loaded:
+        # Prefer most recent best
+        best_ckpts = sorted(
+            glob.glob(os.path.join(checkpoint_dir, "best_model_epoch_*.pth")),
+            key=lambda p: os.path.getmtime(p),
+            reverse=True,
+        )
+        for ckpt_file in best_ckpts:
+            try:
+                print(f"⏪ Attempting resume from best: {ckpt_file}")
+                checkpoint = torch.load(ckpt_file, map_location=device)
+                if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+                    model.load_state_dict(checkpoint['model_state_dict'])
+                    if checkpoint.get('optimizer_state_dict'):
+                        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                    start_epoch = checkpoint.get('epoch', -1) + 1
+                    print(f"✅ Resumed from epoch {start_epoch}")
+                    resume_loaded = True
+                    break
+            except Exception as e:
+                print(f"⚠️  Failed to load {ckpt_file}: {e}")
+
+    if not resume_loaded:
+        epoch_ckpts = sorted(
+            glob.glob(os.path.join(checkpoint_dir, "latest_checkpoint_epoch_*.pth")),
+            key=lambda p: os.path.getmtime(p),
+            reverse=True,
+        )
+        for ckpt_file in epoch_ckpts:
+            try:
+                print(f"⏪ Attempting resume from: {ckpt_file}")
+                checkpoint = torch.load(ckpt_file, map_location=device)
+                if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint and 'optimizer_state_dict' in checkpoint:
+                    model.load_state_dict(checkpoint['model_state_dict'])
+                    if checkpoint['optimizer_state_dict'] is not None:
+                        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                    start_epoch = checkpoint.get('epoch', -1) + 1
+                    print(f"✅ Resumed from epoch {start_epoch}")
+                    resume_loaded = True
+                    break
+            except Exception as e:
+                print(f"⚠️  Failed to load {ckpt_file}: {e}")
 
 
     # Training loop
@@ -721,12 +794,17 @@ def train_model(train_loader, val_loader):
             f"latest_checkpoint_epoch_{epoch+1}.pth"
         )
 
-        # Save best checkpoint
+        # Save best checkpoint (also used for resume preference)
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
             checkpoint_manager.save_checkpoint(
                 model, optimizer, epoch, epoch_record,
                 f"best_model_epoch_{epoch+1}.pth"
+            )
+            # Also update a stable best checkpoint path with the full FP32 state
+            checkpoint_manager.save_checkpoint(
+                model, optimizer, epoch, epoch_record,
+                os.path.basename(best_checkpoint_path)
             )
             print("📌 Best model saved!")
             epochs_no_improve = 0
