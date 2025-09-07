@@ -315,29 +315,7 @@ class CheckpointManager:
         # Cleanup old checkpoints
         self.cleanup_old_checkpoints()
 
-    def save_weights_only(self, model, epoch, metrics, filename, dtype=torch.float16):
-        """Save weights-only checkpoint for inference, optionally cast to dtype to reduce size."""
-        file_path = os.path.join(self.checkpoint_dir, filename)
-        state_dict = model.state_dict()
-        if dtype is not None:
-            reduced_state = {k: v.detach().to('cpu', dtype=dtype) for k, v in state_dict.items()}
-            saved_dtype = str(dtype)
-        else:
-            reduced_state = {k: v.detach().cpu() for k, v in state_dict.items()}
-            saved_dtype = 'float32'
-
-        checkpoint_data = {
-            'epoch': epoch,
-            'model_state_dict': reduced_state,
-            'optimizer_state_dict': None,
-            'metrics': metrics,
-            'weights_dtype': saved_dtype,
-            'timestamp': datetime.now().isoformat()
-        }
-
-        torch.save(checkpoint_data, file_path)
-        self._print_size_notice(file_path, filename)
-        # Do not clean up here to avoid deleting just-saved best weights; cleanup occurs on full saves
+        # (weights-only save removed per user request; always save full FP32 checkpoints)
 
 
 class LiveTrainingVisualizer:
@@ -823,15 +801,10 @@ def train_model(train_loader, val_loader):
                 model, optimizer, epoch, epoch_record,
                 f"best_model_epoch_{epoch+1}.pth"
             )
-            # Save a compact FP16 weights-only copy for faster inference
-            checkpoint_manager.save_weights_only(
-                model, epoch, epoch_record,
-                f"best_model_epoch_{epoch+1}_weights_fp16.pth", dtype=torch.float16
-            )
-            # Maintain/update a stable small file for downstream inference
-            checkpoint_manager.save_weights_only(
-                model, epoch, epoch_record,
-                os.path.basename(best_checkpoint_path), dtype=torch.float16
+            # Also update a stable best checkpoint path with the full FP32 state
+            checkpoint_manager.save_checkpoint(
+                model, optimizer, epoch, epoch_record,
+                os.path.basename(best_checkpoint_path)
             )
             print("📌 Best model saved!")
             epochs_no_improve = 0
